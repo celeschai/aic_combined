@@ -18,7 +18,6 @@ keywords = ["extension", "template", "isaaclab"]
 "isaacsim.core.api" = {}
 "isaacsim.gui.components" = {}
 "omni.kit.uiapp" = {}
-"omni.physx" = {}
 # NOTE: Add additional dependencies here
 
 [[python.module]]

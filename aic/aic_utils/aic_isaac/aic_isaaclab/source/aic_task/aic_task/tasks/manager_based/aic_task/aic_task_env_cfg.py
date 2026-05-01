@@ -1,19 +1,34 @@
-# Copyright (c) 2022-2026, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
+# Copyright (c) 2022-2026, The Isaac Lab Project Developers.
 # All rights reserved.
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-import math
-import os
-from dataclasses import MISSING
+"""Generic AIC task env config: scene + OSC infrastructure with placeholder MDP.
 
+This module provides the *base* environment used by ``AICTaskEnv``:
+
+- Scene: UR5e + gripper + cable, scene USD, task board.
+- Action: 6-D Cartesian delta (raw joint efforts are overwritten by OSC).
+- Observations: EE state in robot base frame + last action.
+- Rewards: action-rate regularization only (placeholder).
+- Terminations: time-out only.
+- Events: dome-light randomization at reset.
+
+Task-specific shaping (rewards, command terms, success detection, ...) should
+live in a downstream config that subclasses ``AICTaskEnvCfg``.
+"""
+
+import os
+
+import isaaclab.envs.mdp as il_mdp
 import isaaclab.sim as sim_utils
-from isaaclab.actuators import ImplicitActuatorCfg
+from isaaclab.actuators import IdealPDActuatorCfg
 from isaaclab.assets import ArticulationCfg, AssetBaseCfg, RigidObjectCfg
+from isaaclab.devices import DevicesCfg
+from isaaclab.devices.gamepad import Se3GamepadCfg
+from isaaclab.devices.keyboard import Se3KeyboardCfg
+from isaaclab.devices.spacemouse import Se3SpaceMouseCfg
 from isaaclab.envs import ManagerBasedRLEnvCfg
-from isaaclab.envs.mdp import JointPositionActionCfg
-from isaaclab.envs.mdp import DifferentialInverseKinematicsActionCfg
-from isaaclab.controllers.differential_ik_cfg import DifferentialIKControllerCfg
 from isaaclab.managers import ActionTermCfg as ActionTerm
 from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import ObservationGroupCfg as ObsGroup
@@ -22,17 +37,11 @@ from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.scene import InteractiveSceneCfg
+from isaaclab.sensors import ContactSensorCfg
 from isaaclab.utils import configclass
-from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
-from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
-from isaaclab.sensors import TiledCameraCfg
-from isaaclab.devices import DevicesCfg
-from isaaclab.devices.keyboard import Se3KeyboardCfg
-from isaaclab.devices.spacemouse import Se3SpaceMouseCfg
-from isaaclab.devices.gamepad import Se3GamepadCfg
 
 from . import mdp
-from .mdp.events import randomize_dome_light, randomize_board_and_parts
+from .mdp.events import ARM_HOME_JOINT_POS, randomize_dome_light
 
 # Resolve asset directory relative to this file (portable across machines)
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -40,7 +49,24 @@ AIC_ASSET_DIR = os.path.join(_THIS_DIR, "Intrinsic_assets")
 AIC_SCENE_DIR = AIC_ASSET_DIR
 AIC_PARTS_DIR = os.path.join(AIC_ASSET_DIR, "assets")
 
-EXTENSION_PATH = os.path.dirname(os.path.abspath(__file__))
+# Rigid-body name regex for arm/gripper links (used by ContactSensor).
+_AIC_ROBOT_CONTACT_BODIES_RE = (
+    "(shoulder_link|upper_arm_link|forearm_link|wrist_1_link|wrist_2_link|wrist_3_link|"
+    "flange|tool0|ati_base_link|ati_tool_link|gripper_hande_base_link|gripper_tcp|"
+    "gripper_hande_finger_link_l|gripper_hande_finger_link_r|ft_frame)"
+)
+
+OSC_ARM_JOINTS = [
+    "shoulder_pan_joint",
+    "shoulder_lift_joint",
+    "elbow_joint",
+    "wrist_1_joint",
+    "wrist_2_joint",
+    "wrist_3_joint",
+]
+
+_EE_TCP = ["gripper_tcp"]
+
 
 ##
 # Scene definition
@@ -49,95 +75,54 @@ EXTENSION_PATH = os.path.dirname(os.path.abspath(__file__))
 
 @configclass
 class AICTaskSceneCfg(InteractiveSceneCfg):
-    """Scene for aic task: UR5e robot, aic_scene, task_board."""
+    """Scene for the AIC task: UR5e + gripper + cable, scene USD, task board."""
 
-    # UR5e + gripper (fully defined here using local asset)
     robot: ArticulationCfg = ArticulationCfg(
-        prim_path="{ENV_REGEX_NS}/Robot",
+        prim_path="{ENV_REGEX_NS}/aic_unified_robot",
         spawn=sim_utils.UsdFileCfg(
             usd_path=os.path.join(AIC_ASSET_DIR, "aic_unified_robot_cable_sdf.usd"),
-            rigid_props=sim_utils.RigidBodyPropertiesCfg(
-                # disable_gravity=True,
-                max_depenetration_velocity=5.0,
-            ),
+            rigid_props=sim_utils.RigidBodyPropertiesCfg(max_depenetration_velocity=5.0),
             articulation_props=sim_utils.ArticulationRootPropertiesCfg(
-                enabled_self_collisions=True,
+                enabled_self_collisions=False,
                 solver_position_iteration_count=16,
-                solver_velocity_iteration_count=8,
+                solver_velocity_iteration_count=4,
             ),
-            activate_contact_sensors=False,
+            activate_contact_sensors=True,
         ),
         init_state=ArticulationCfg.InitialStateCfg(
-            pos=(-0.18, -0.122, 0),
+            pos=(-0.2, 0.2, 1.14),
             rot=(0.0, 0.0, 0.0, 1.0),
-            joint_pos={
-                "shoulder_pan_joint": 0.1597,
-                "shoulder_lift_joint": -1.3542,
-                "elbow_joint": -1.6648,
-                "wrist_1_joint": -1.6933,
-                "wrist_2_joint": 1.5710,
-                "wrist_3_joint": 1.4110,
-            },
+            joint_pos=dict(ARM_HOME_JOINT_POS),
         ),
         actuators={
-            "arm": ImplicitActuatorCfg(
-                joint_names_expr=[
-                    "shoulder_pan_joint",
-                    "shoulder_lift_joint",
-                    "elbow_joint",
-                    "wrist_1_joint",
-                    "wrist_2_joint",
-                    "wrist_3_joint",
-                ],
-                effort_limit_sim=87.0,
-                stiffness=2000.0,
-                damping=100.0,
+            # Zero PD: joint torques come from AICTaskEnv OSC.
+            "arm": IdealPDActuatorCfg(
+                joint_names_expr=OSC_ARM_JOINTS,
+                effort_limit_sim=150.0,
+                stiffness=0.0,
+                damping=0.0,
             ),
-            # "gripper": ImplicitActuatorCfg(
-            #     joint_names_expr=[
-            #         "gripper_left_finger_joint",
-            #         "gripper_right_finger_joint",
-            #     ],
-            #     effort_limit_sim=20.0,
-            #     stiffness=800.0,
-            #     damping=40.0,
-            # ),
         },
     )
 
-    # cable = ArticulationCfg(
-    #     prim_path="{ENV_REGEX_NS}/Robot/cable",
-    #     spawn=None,
-    #     init_state=ArticulationCfg.InitialStateCfg(),
-    #     actuators={},
-    #     articulation_props=sim_utils.ArticulationRootPropertiesCfg(
-    #         solver_position_iteration_count=64,
-    #         solver_velocity_iteration_count=32,
-    #     ),
-    # )
-
-    # lights
     light = AssetBaseCfg(
         prim_path="/World/light",
         spawn=sim_utils.DomeLightCfg(color=(0.75, 0.75, 0.75), intensity=2500.0),
     )
 
-    # world
     ground = AssetBaseCfg(
         prim_path="/World/ground",
         spawn=sim_utils.GroundPlaneCfg(),
-        init_state=AssetBaseCfg.InitialStateCfg(pos=(0.0, 0.0, -1.05)),
+        init_state=AssetBaseCfg.InitialStateCfg(pos=(0.0, 0.0, 0.0)),
     )
 
     aic_scene = AssetBaseCfg(
         prim_path="{ENV_REGEX_NS}/aic_scene",
         spawn=sim_utils.UsdFileCfg(
             usd_path=os.path.join(AIC_SCENE_DIR, "scene", "aic.usd"),
-            # usd_path=f"/home/nvidia/Downloads/aic_world.usd",
         ),
         init_state=AssetBaseCfg.InitialStateCfg(
-            pos=(0.0, 0.0, -1.15),
-            rot=(1.0, 0.0, 0.0, 0.0),
+            pos=(0.0, 0.0, 0.0), rot=(1.0, 0.0, 0.0, 0.0)
         ),
     )
 
@@ -145,181 +130,76 @@ class AICTaskSceneCfg(InteractiveSceneCfg):
         prim_path="{ENV_REGEX_NS}/task_board",
         spawn=sim_utils.UsdFileCfg(
             usd_path=os.path.join(
-                AIC_PARTS_DIR, "Task Board Base", "task_board_rigid.usd"
+                AIC_PARTS_DIR, "Task Board Base", "task_board_assembly.usd"
             ),
-            rigid_props=sim_utils.RigidBodyPropertiesCfg(
-                kinematic_enabled=True,
-            ),
+            activate_contact_sensors=True,
+            rigid_props=sim_utils.RigidBodyPropertiesCfg(kinematic_enabled=True),
         ),
         init_state=RigidObjectCfg.InitialStateCfg(
-            pos=(0.2837, 0.229, 0.0),
-            # rot=(0.70686, -0.01851, 0.70686, 0.01851),
+            pos=(0.15, -0.2, 1.14), rot=(1.0, 0.0, 0.0, 0.0)
         ),
     )
 
-    sc_port = RigidObjectCfg(
-        prim_path="{ENV_REGEX_NS}/sc_port",
-        spawn=sim_utils.UsdFileCfg(
-            usd_path=os.path.join(AIC_PARTS_DIR, "SC Port", "sc_port.usd"),
-            rigid_props=sim_utils.RigidBodyPropertiesCfg(
-                kinematic_enabled=True,
-            ),
+    # Net contact forces (world frame) on tracked arm/gripper links.
+    robot_contact = ContactSensorCfg(
+        prim_path=(
+            "{ENV_REGEX_NS}/aic_unified_robot/aic_unified_robot/"
+            + _AIC_ROBOT_CONTACT_BODIES_RE
         ),
-        init_state=RigidObjectCfg.InitialStateCfg(
-            pos=(0.2904, 0.1928, 0.005),
-            rot=(0.73136, 0.0, 0.0, -0.682),
-        ),
+        update_period=0.0,
+        history_length=0,
+        debug_vis=False,
     )
-
-    sc_port_2 = RigidObjectCfg(
-        prim_path="{ENV_REGEX_NS}/sc_port_2",
-        spawn=sim_utils.UsdFileCfg(
-            usd_path=os.path.join(AIC_PARTS_DIR, "SC Port", "sc_port.usd"),
-            rigid_props=sim_utils.RigidBodyPropertiesCfg(
-                kinematic_enabled=True,
-            ),
-        ),
-        init_state=RigidObjectCfg.InitialStateCfg(
-            pos=(0.2913, 0.1507, 0.005),
-            rot=(0.73136, 0.0, 0.0, -0.682),
-        ),
-    )
-
-    nic_card = RigidObjectCfg(
-        prim_path="{ENV_REGEX_NS}/nic_card",
-        spawn=sim_utils.UsdFileCfg(
-            usd_path=os.path.join(AIC_PARTS_DIR, "NIC Card", "nic_card.usd"),
-            # scale=(0.009, 0.009, 0.009),
-            rigid_props=sim_utils.RigidBodyPropertiesCfg(
-                kinematic_enabled=True,
-            ),
-        ),
-        init_state=RigidObjectCfg.InitialStateCfg(
-            pos=(0.25135, 0.25229, 0.0743),
-            rot=(0.0, 0.0, -0.7068252, 0.7073883),
-        ),
-    )
-
-    # nic_card_mount = AssetBaseCfg(
-    #     prim_path="{ENV_REGEX_NS}/nic_card_mount",
-    #     spawn=sim_utils.UsdFileCfg(
-    #         usd_path=os.path.join(AIC_PARTS_DIR, "NIC Card Mount", "nic_card_mount_visual.usd"),
-    #         scale=(0.00001, 0.00001, 0.00001),
-    #     ),
-    #     init_state=AssetBaseCfg.InitialStateCfg(
-    #         pos=(1.02, -0.010, 0.080),
-    #         rot=(0.7073, 0.7073, 0.7073, -0.7073),
-    #     ),
-    # )
-
-    def __post_init__(self):
-        super().__post_init__()
-
-        _cam_spawn = sim_utils.PinholeCameraCfg(
-            focal_length=22.48,
-            focus_distance=0.0,
-            horizontal_aperture=20.955,
-            vertical_aperture=18.627,
-            clipping_range=(0.07, 20.0),
-        )
-
-        self.center_camera = TiledCameraCfg(
-            prim_path="{ENV_REGEX_NS}/Robot/aic_unified_robot/center_camera_optical/center_camera",
-            spawn=_cam_spawn,
-            height=224,
-            width=224,
-            data_types=["rgb"],
-            offset=TiledCameraCfg.OffsetCfg(
-                pos=(0.0, 0.0, 0.0),
-                rot=(1.0, 0.0, 0.0, 0.0),
-                convention="ros",
-            ),
-        )
-        self.left_camera = TiledCameraCfg(
-            prim_path="{ENV_REGEX_NS}/Robot/aic_unified_robot/left_camera_optical/left_camera",
-            spawn=_cam_spawn,
-            height=224,
-            width=224,
-            data_types=["rgb"],
-            offset=TiledCameraCfg.OffsetCfg(
-                pos=(0.0, 0.0, 0.0),
-                rot=(1.0, 0.0, 0.0, 0.0),
-                convention="ros",
-            ),
-        )
-        self.right_camera = TiledCameraCfg(
-            prim_path="{ENV_REGEX_NS}/Robot/aic_unified_robot/right_camera_optical/right_camera",
-            spawn=_cam_spawn,
-            height=224,
-            width=224,
-            data_types=["rgb"],
-            offset=TiledCameraCfg.OffsetCfg(
-                pos=(0.0, 0.0, 0.0),
-                rot=(1.0, 0.0, 0.0, 0.0),
-                convention="ros",
-            ),
-        )
 
 
 ##
-# MDP settings
+# MDP settings (placeholders)
 ##
 
 
 @configclass
 class CommandsCfg:
-    """Command terms for the MDP."""
+    """Generic Cartesian goal-pose command (uniform sampling around the EE).
 
-    ee_pose = mdp.UniformPoseCommandCfg(
+    Subclass and replace ``ee_pose`` with a task-specific command for goal
+    conditioning (e.g. an insertion target or a tracked frame).
+    """
+
+    ee_pose = il_mdp.UniformPoseCommandCfg(
         asset_name="robot",
-        body_name=MISSING,
+        body_name="gripper_tcp",
         resampling_time_range=(4.0, 4.0),
-        debug_vis=True,
-        ranges=mdp.UniformPoseCommandCfg.Ranges(
-            pos_x=(0.55, 0.75),
-            pos_y=(-0.10, 0.02),
-            pos_z=(0.01, 0.15),
+        debug_vis=False,
+        ranges=il_mdp.UniformPoseCommandCfg.Ranges(
+            pos_x=(0.30, 0.50),
+            pos_y=(-0.20, 0.20),
+            pos_z=(1.10, 1.30),
             roll=(0.0, 0.0),
-            pitch=MISSING,  # depends on end-effector axis
-            yaw=(-3.14, 3.14),
+            pitch=(0.0, 0.0),
+            yaw=(-0.5, 0.5),
         ),
     )
 
 
 @configclass
 class ActionsCfg:
-    """Action specifications for the MDP."""
+    """Dummy joint effort term — actual torques are written by ``AICTaskEnv._apply_osc``."""
 
-    arm_action: ActionTerm = MISSING
+    arm_action: ActionTerm = il_mdp.JointEffortActionCfg(
+        asset_name="robot", joint_names=OSC_ARM_JOINTS, scale=0.0
+    )
     gripper_action: ActionTerm | None = None
 
 
 @configclass
 class EventCfg:
-    """Configuration for events."""
+    """Reset-time events: small joint-position jitter + dome-light randomization."""
 
     reset_robot_joints = EventTerm(
         func=mdp.reset_joints_by_offset,
         mode="reset",
-        params={
-            "position_range": (-0.05, 0.05),
-            "velocity_range": (0.0, 0.0),
-        },
+        params={"position_range": (-0.05, 0.05), "velocity_range": (0.0, 0.0)},
     )
-
-    # randomize_robot_pose = EventTerm(
-    #     func=mdp.reset_root_state_uniform,
-    #     mode="reset",
-    #     params={
-    #         "asset_cfg": SceneEntityCfg("robot"),
-    #         "pose_range": {
-    #             "x": (-0.1, 0.1),   # random offset around init_state
-    #             "y": (-0.1, 0.1),
-    #             "z": (0.0, 0.0),
-    #         },
-    #         "velocity_range": {},
-    #     },
-    # )
 
     randomize_light = EventTerm(
         func=randomize_dome_light,
@@ -330,213 +210,55 @@ class EventCfg:
         },
     )
 
-    randomize_board_and_parts = EventTerm(
-        func=randomize_board_and_parts,
-        mode="reset",
-        params={
-            "board_scene_name": "task_board",
-            "board_default_pos": (0.2837, 0.229, 0.0),
-            "board_range": {"x": (-0.005, 0.005), "y": (-0.005, 0.005)},
-            "parts": [
-                {
-                    "scene_name": "sc_port",
-                    "offset": (0.0067, -0.0362, 0.005),
-                    "pose_range": {"x": (-0.005, 0.02)},
-                },
-                {
-                    "scene_name": "sc_port_2",
-                    "offset": (0.0076, -0.0783, 0.005),
-                    "pose_range": {"x": (-0.005, 0.02)},
-                },
-                {
-                    "scene_name": "nic_card",
-                    "offset": (-0.03235, 0.02329, 0.0743),
-                    "pose_range": {"y": (0.0, 0.12)},
-                    "snap_step": {"y": 0.04},
-                },
-            ],
-        },
-    )
-
 
 @configclass
 class TerminationsCfg:
-    """Termination terms for the MDP."""
+    """Time-out only — add task-specific termination terms in subclasses."""
 
     time_out = DoneTerm(func=mdp.time_out, time_out=True)
 
 
 @configclass
 class ObservationsCfg:
-    """Observation specifications for the MDP: robot state, ee pose, pose command."""
+    """Cartesian EE proprioception in robot-base frame, plus last action."""
 
     @configclass
     class PolicyCfg(ObsGroup):
-        """Observations for policy: joint state, ee pose, pose command."""
-
-        # Robot state (joint space)
-        joint_pos = ObsTerm(
-            func=mdp.joint_pos_rel, noise=Unoise(n_min=-0.01, n_max=0.01)
+        ee_pos = ObsTerm(
+            func=mdp.ee_pos_base,
+            params={"asset_cfg": SceneEntityCfg("robot", body_names=_EE_TCP)},
         )
-        joint_vel = ObsTerm(
-            func=mdp.joint_vel_rel, noise=Unoise(n_min=-0.01, n_max=0.01)
+        ee_rpy = ObsTerm(
+            func=mdp.ee_rpy_base,
+            params={"asset_cfg": SceneEntityCfg("robot", body_names=_EE_TCP)},
         )
-        # End-effector pose in env frame (pos xyz + quat wxyz = 7 dims)
-        eef_pose = ObsTerm(
-            func=mdp.body_pose_w,
-            params={"asset_cfg": SceneEntityCfg("robot", body_names="wrist_3_link")},
-            noise=Unoise(n_min=-0.001, n_max=0.001),
+        ee_lin_vel = ObsTerm(
+            func=mdp.ee_lin_vel_base,
+            params={"asset_cfg": SceneEntityCfg("robot", body_names=_EE_TCP)},
         )
-        # Command (target ee pose)
-        pose_command = ObsTerm(
-            func=mdp.generated_commands, params={"command_name": "ee_pose"}
+        ee_ang_vel = ObsTerm(
+            func=mdp.ee_ang_vel_base,
+            params={"asset_cfg": SceneEntityCfg("robot", body_names=_EE_TCP)},
         )
-
-        # Body forces
-        body_forces = ObsTerm(
-            func=mdp.body_incoming_wrench,
-            scale=0.1,
-            params={
-                "asset_cfg": SceneEntityCfg(
-                    "robot",
-                    body_names=[
-                        "base_link",
-                        "shoulder_link",
-                        "upper_arm_link",
-                        "forearm_link",
-                        "wrist_1_link",
-                        "wrist_2_link",
-                        "wrist_3_link",
-                    ],
-                )
-            },
-        )
-
-        center_rgb = ObsTerm(
-            func=mdp.image_features,
-            params={
-                "sensor_cfg": SceneEntityCfg("center_camera"),
-                "data_type": "rgb",
-                "model_name": "resnet18",
-            },
-        )
-        left_rgb = ObsTerm(
-            func=mdp.image_features,
-            params={
-                "sensor_cfg": SceneEntityCfg("left_camera"),
-                "data_type": "rgb",
-                "model_name": "resnet18",
-            },
-        )
-        right_rgb = ObsTerm(
-            func=mdp.image_features,
-            params={
-                "sensor_cfg": SceneEntityCfg("right_camera"),
-                "data_type": "rgb",
-                "model_name": "resnet18",
-            },
-        )
-
-        # Last action
-        actions = ObsTerm(func=mdp.last_action)
+        actions = ObsTerm(func=il_mdp.last_action)
 
         def __post_init__(self):
             self.enable_corruption = False
             self.concatenate_terms = True
+            self.history_length = 0
 
-    # observation groups
     policy: PolicyCfg = PolicyCfg()
 
 
 @configclass
 class RewardsCfg:
-    """Reward terms for the MDP."""
+    """Placeholder rewards — only generic regularization. Task-specific shaping
+    should be added by subclasses.
+    """
 
-    # -- Position tracking (coarse): L2 penalty drives the EE toward the target --
-    end_effector_position_tracking = RewTerm(
-        func=mdp.position_command_error,
-        weight=-0.2,
-        params={
-            "asset_cfg": SceneEntityCfg("robot", body_names=MISSING),
-            "command_name": "ee_pose",
-        },
-    )
-    # -- Position tracking (fine): tanh kernel provides dense signal near target --
-    end_effector_position_tracking_fine_grained = RewTerm(
-        func=mdp.position_command_error_tanh,
-        weight=0.1,
-        params={
-            "asset_cfg": SceneEntityCfg("robot", body_names=MISSING),
-            "std": 0.1,
-            "command_name": "ee_pose",
-        },
-    )
-    # -- Position tracking (exponential): sharp bonus at very close range for insertion --
-    end_effector_position_tracking_exp = RewTerm(
-        func=mdp.position_command_error_exp,
-        weight=0.3,
-        params={
-            "asset_cfg": SceneEntityCfg("robot", body_names=MISSING),
-            "sigma": 0.05,
-            "command_name": "ee_pose",
-        },
-    )
-
-    # -- Orientation tracking (coarse): angular-distance penalty --
-    end_effector_orientation_tracking = RewTerm(
-        func=mdp.orientation_command_error,
-        weight=-0.1,
-        params={
-            "asset_cfg": SceneEntityCfg("robot", body_names=MISSING),
-            "command_name": "ee_pose",
-        },
-    )
-    # -- Orientation tracking (fine): tanh kernel for precise alignment --
-    end_effector_orientation_tracking_fine_grained = RewTerm(
-        func=mdp.orientation_command_error_tanh,
-        weight=0.05,
-        params={
-            "asset_cfg": SceneEntityCfg("robot", body_names=MISSING),
-            "std": 0.25,
-            "command_name": "ee_pose",
-        },
-    )
-
-    # -- Sparse reaching bonus: +1 when EE is within 2 cm of the target --
-    reaching_bonus = RewTerm(
-        func=mdp.ee_reaching_bonus,
-        weight=1.0,
-        params={
-            "asset_cfg": SceneEntityCfg("robot", body_names=MISSING),
-            "threshold": 0.02,
-            "command_name": "ee_pose",
-        },
-    )
-
-    # -- Smoothness penalties --
-    action_rate = RewTerm(func=mdp.action_rate_l2, weight=-0.0001)
-    joint_vel = RewTerm(
-        func=mdp.joint_vel_l2,
-        weight=-0.0001,
-        params={"asset_cfg": SceneEntityCfg("robot")},
-    )
-    joint_acc = RewTerm(
-        func=mdp.joint_acc_l2,
-        weight=-1.0e-7,
-        params={"asset_cfg": SceneEntityCfg("robot")},
-    )
-    joint_torques = RewTerm(
-        func=mdp.joint_torques_l2,
-        weight=-1.0e-6,
-        params={"asset_cfg": SceneEntityCfg("robot")},
-    )
-
-    # -- Safety: penalize joints approaching their limits --
-    joint_pos_limits = RewTerm(
-        func=mdp.joint_pos_limits,
-        weight=-0.1,
-        params={"asset_cfg": SceneEntityCfg("robot")},
-    )
+    action_rate = RewTerm(func=il_mdp.action_rate_l2, weight=-0.01)
+    joint_acc = RewTerm(func=mdp.joint_acc_l2, weight=-1e-7)
+    ee_jerk = RewTerm(func=mdp.ee_jerk_penalty, weight=-0.01)
 
 
 ##
@@ -546,15 +268,33 @@ class RewardsCfg:
 
 @configclass
 class AICTaskEnvCfg(ManagerBasedRLEnvCfg):
-    """AIC task env: UR5e robot and custom scene."""
+    """Base AIC task env: scene + OSC infrastructure with placeholder MDP.
 
-    # Scene settings
-    scene: AICTaskSceneCfg = AICTaskSceneCfg(num_envs=1, env_spacing=4.0)
-    # Basic settings
+    Subclass and override ``commands`` / ``rewards`` / ``terminations`` /
+    ``observations`` / ``events`` to define a concrete task.
+    """
+
+    # OperationalSpaceController gains (see ``AICTaskEnv._osc_setup``)
+    osc_stiffness: list[float] = [300.0, 300.0, 300.0, 20.0, 20.0, 20.0]
+    osc_damping: list[float] = [35.0, 35.0, 35.0, 9.0, 9.0, 9.0]
+    osc_inertial_dynamics_decoupling: bool = False
+    osc_gravity_compensation: bool = True
+    osc_effort_limit: float = 150.0
+    osc_ee_body: str = "gripper_tcp"
+
+    # 6-D Cartesian delta scaling (raw action ∈ [-1, 1]).
+    action_delta_pos_scale: float = 0.0005   # 0.5 mm/step → ~15 mm/s @ 30 Hz
+    action_delta_ori_scale: float = 0.009    # ~0.5°/step  → ~15°/s   @ 30 Hz
+
+    # IK reset (DLS) parameters — used by ``AICTaskEnv._ik_reset``.
+    ik_steps: int = 80
+    ik_lambda: float = 0.05
+    ik_step_size: float = 0.5
+
+    scene: AICTaskSceneCfg = AICTaskSceneCfg(num_envs=64, env_spacing=2.0)
     observations: ObservationsCfg = ObservationsCfg()
     actions: ActionsCfg = ActionsCfg()
     commands: CommandsCfg = CommandsCfg()
-    # MDP settings
     rewards: RewardsCfg = RewardsCfg()
     terminations: TerminationsCfg = TerminationsCfg()
     events: EventCfg = EventCfg()
@@ -562,64 +302,22 @@ class AICTaskEnvCfg(ManagerBasedRLEnvCfg):
     def __post_init__(self) -> None:
         super().__post_init__()
 
-        # General settings
         self.decimation = 4
         self.sim.render_interval = self.decimation
-        self.episode_length_s = 200.0
+        self.episode_length_s = 15.0
         self.sim.dt = 1.0 / 120.0
-        # self.sim.gravity = (0.0, 0.0, 3)
-        self.viewer.eye = (8.0, 0.0, 5.0)
+        self.scene.robot.actuators["arm"].effort_limit_sim = self.osc_effort_limit
 
-        # Override reward/command body to UR end-effector
-        ee_body = ["wrist_3_link"]
-        self.rewards.end_effector_position_tracking.params["asset_cfg"].body_names = (
-            ee_body
-        )
-        self.rewards.end_effector_position_tracking_fine_grained.params[
-            "asset_cfg"
-        ].body_names = ee_body
-        self.rewards.end_effector_position_tracking_exp.params[
-            "asset_cfg"
-        ].body_names = ee_body
-        self.rewards.end_effector_orientation_tracking.params[
-            "asset_cfg"
-        ].body_names = ee_body
-        self.rewards.end_effector_orientation_tracking_fine_grained.params[
-            "asset_cfg"
-        ].body_names = ee_body
-        self.rewards.reaching_bonus.params["asset_cfg"].body_names = ee_body
+        # Viewport / video framing.
+        self.viewer.origin_type = "asset_body"
+        self.viewer.asset_name = "robot"
+        self.viewer.body_name = "gripper_tcp"
+        self.viewer.env_index = 0
+        self.viewer.eye = (0.22, 0.12, 0.20)
+        self.viewer.lookat = (0.0, 0.0, 0.0)
 
-        # # Arm action: joint position control
-        # self.actions.arm_action = JointPositionActionCfg(
-        #     asset_name="robot", joint_names=[".*"], scale=0.5, use_default_offset=True
-        # )
+        self.scene.ground = None  # type: ignore[assignment]
 
-        # Arm action: differential IK (for teleoperation)
-        self.actions.arm_action = DifferentialInverseKinematicsActionCfg(
-            asset_name="robot",
-            joint_names=[
-                "shoulder_pan_joint",
-                "shoulder_lift_joint",
-                "elbow_joint",
-                "wrist_1_joint",
-                "wrist_2_joint",
-                "wrist_3_joint",
-            ],
-            body_name="wrist_3_link",
-            controller=DifferentialIKControllerCfg(
-                command_type="pose",
-                use_relative_mode=True,
-                ik_method="svd",
-                ik_params={"k_val": 1.0, "min_singular_value": 1e-5},
-            ),
-            scale=0.05,
-        )
-
-        # Command generator: end-effector body and pitch (wrist_3_link, EE along x)
-        self.commands.ee_pose.body_name = "wrist_3_link"
-        self.commands.ee_pose.ranges.pitch = (math.pi / 2, math.pi / 2)
-
-        # Teleop device configuration
         self.teleop_devices = DevicesCfg(
             devices={
                 "keyboard": Se3KeyboardCfg(
@@ -628,13 +326,7 @@ class AICTaskEnvCfg(ManagerBasedRLEnvCfg):
                     gripper_term=False,
                     sim_device=self.sim.device,
                 ),
-                "gamepad": Se3GamepadCfg(
-                    gripper_term=False,
-                    sim_device=self.sim.device,
-                ),
-                "spacemouse": Se3SpaceMouseCfg(
-                    gripper_term=False,
-                    sim_device=self.sim.device,
-                ),
+                "gamepad": Se3GamepadCfg(gripper_term=False, sim_device=self.sim.device),
+                "spacemouse": Se3SpaceMouseCfg(gripper_term=False, sim_device=self.sim.device),
             },
         )

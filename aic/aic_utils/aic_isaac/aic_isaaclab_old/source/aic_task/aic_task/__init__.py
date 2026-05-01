@@ -3,6 +3,12 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-import gymnasium as gym  # noqa: F401
+"""
+Python module serving as a project/extension template.
+"""
 
-from . import aic_task  # noqa: F401 — registers AIC-Task-v0
+# Register Gym environments.
+from .tasks import *
+
+# Register UI extensions.
+from .extension import *

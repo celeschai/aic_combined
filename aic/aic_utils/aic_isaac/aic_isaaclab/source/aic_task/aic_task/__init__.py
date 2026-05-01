@@ -8,7 +8,4 @@ Python module serving as a project/extension template.
 """
 
 # Register Gym environments.
-from .tasks import *
-
-# Register UI extensions.
-from .extension import *
+from .tasks import *  # noqa: F401, F403
